@@ -1,5 +1,7 @@
-from protein_dataset_processor import ProteinDatasetProcessor
+from ps4_data.ps4_dataset_processor import PS4DatasetProcessor
+from cb513_data.cb513_dataset_processor import CB513DatasetProcessor
 import numpy as np
+import torch
 import time
 
 
@@ -28,9 +30,7 @@ class ChouFasmanPredictor:
         "X": {"Pa": 100, "Pb": 100, "Pt": 100, "f": [0.1, 0.1, 0.1, 0.1]},
     }
 
-    DSSP3_MAP = {"H": "H", "E": "E", "C": "C", "T": "C"}
-
-    def __init__(self, processor: ProteinDatasetProcessor):
+    def __init__(self, processor):
         self.processor = processor
         self.helix_window = 6
         self.sheet_window = 5
@@ -133,18 +133,18 @@ class ChouFasmanPredictor:
             "correct_q8": correct_q8,
         }
 
-        print("\nResults")
-        print(f"Total proteins evaluated: {self.stats['total_proteins']}")
-        print(f"Total residues: {self.stats['total_residues']:,}")
-        print(f"Q3 Accuracy: {q3_accuracy:.2f}%")
-        print(f"Q8 Accuracy: {q8_accuracy:.2f}%")
-
         return self.stats
 
+    def print_statistics(self):
+        print("\nStatistics")
+        print(f"Total proteins: {self.stats['total_proteins']}")
+        print(f"Total residues: {self.stats['total_residues']:,}")
+        print(f"Q3 Accuracy: {self.stats['q3_accuracy']:.2f}%")
+        print(f"Q8 Accuracy: {self.stats['q8_accuracy']:.2f}%")
+
     def get_prediction_by_index(self, idx):
-        return {
+        result = {
             "index": idx,
-            "chain_id": self.processor.chain_ids[idx],
             "sequence": self.processor.input_seqs[idx],
             "true_dssp3": self.processor.dssp3_seqs[idx],
             "true_dssp8": self.processor.dssp8_seqs[idx],
@@ -152,15 +152,17 @@ class ChouFasmanPredictor:
             "predicted_dssp8": self.predictions_dssp8[idx],
             "length": len(self.processor.input_seqs[idx]),
         }
+        if hasattr(self.processor, "chain_ids"):
+            result["chain_id"] = self.processor.chain_ids[idx]
+        return result
 
-    def get_prediction_by_chain_id(self, chain_id):
-        idx = self.processor.chain_id_to_idx[chain_id]
-        return self.get_prediction_by_index(idx)
-
-    def print_sample_prediction(self, idx):
+    def print_sample(self, idx):
         sample = self.get_prediction_by_index(idx)
 
-        print(f"\nSample protein at index {idx} (chain ID: {sample['chain_id']})")
+        header = f"\nSample protein at index {idx}"
+        if "chain_id" in sample:
+            header += f" (chain ID: {sample['chain_id']})"
+        print(header)
         print(f"Sequence length: {sample['length']}")
 
         seq = sample["sequence"]
@@ -175,29 +177,90 @@ class ChouFasmanPredictor:
         print(f"Q3 Accuracy for this protein: {100 * matches_q3 / len(seq):.2f}%")
         print(f"Q8 Accuracy for this protein: {100 * matches_q8 / len(seq):.2f}%")
 
-        display_len = min(60, len(seq))
-        print(f"First {display_len} residues")
-        print(f"Sequence: {seq[:display_len]}")
-        print(f"True Q3:  {true_q3[:display_len]}")
-        print(f"Pred Q3:  {pred_q3[:display_len]}")
-        print(f"True Q8:  {true_q8[:display_len]}")
-        print(f"Pred Q8:  {pred_q8[:display_len]}")
+        display_len = min(50, len(seq))
+        print(f"\nFirst {display_len} residues")
+        print(f"Sequence: {seq[:display_len]}...")
+        print(f"True Q3:  {true_q3[:display_len]}...")
+        print(f"Pred Q3:  {pred_q3[:display_len]}...")
+        print(f"True Q8:  {true_q8[:display_len]}...")
+        print(f"Pred Q8:  {pred_q8[:display_len]}...")
+
+
+def save_results(ps4_stats, cb513_stats, output_path="chou_fasman_results.pt"):
+    data = {
+        "ps4": ps4_stats,
+        "cb513": cb513_stats,
+    }
+    torch.save(data, output_path)
+    print(f"\nSaved results to {output_path}")
+
+
+def load_results(pt_path="chou_fasman_results.pt"):
+    data = torch.load(pt_path, weights_only=False)
+    print(f"\nLoaded results from {pt_path}")
+    return data
+
+
+def print_summary(ps4_stats, cb513_stats):
+    print(
+        f"\n{'Dataset':<12} {'Proteins':>10} {'Residues':>12} {'Q3 Acc':>10} {'Q8 Acc':>10}"
+    )
+    print(
+        f"{'PS4':<12} {ps4_stats['total_proteins']:>10} "
+        f"{ps4_stats['total_residues']:>12,} "
+        f"{ps4_stats['q3_accuracy']:>9.2f}% "
+        f"{ps4_stats['q8_accuracy']:>9.2f}%"
+    )
+    print(
+        f"{'CB513':<12} {cb513_stats['total_proteins']:>10} "
+        f"{cb513_stats['total_residues']:>12,} "
+        f"{cb513_stats['q3_accuracy']:>9.2f}% "
+        f"{cb513_stats['q8_accuracy']:>9.2f}%"
+    )
 
 
 def main():
+    sample_index = 0
+    save_path = "chou_fasman_results.pt"
+
+    # PS4 Dataset
+    print("PS4 Dataset")
     start = time.perf_counter()
-    pt_path = "ps4_dataset.pt"
-    processor = ProteinDatasetProcessor.load(pt_path)
-    predictor = ChouFasmanPredictor(processor)
-    predictor.evaluate()
+    ps4_processor = PS4DatasetProcessor.load("ps4_data/ps4_dataset.pt")
+    ps4_predictor = ChouFasmanPredictor(ps4_processor)
+    ps4_predictor.evaluate()
     end = time.perf_counter()
-
-    predictor.print_sample_prediction(0)
-
+    ps4_predictor.print_statistics()
+    ps4_predictor.print_sample(sample_index)
     print(
-        f"Loading and predictions made for {len(predictor.predictions_dssp3)} sequences in {end - start:.6f} seconds,\n"
-        f"with {predictor.stats['q3_accuracy']:.2f}% Q3 accuracy and {predictor.stats['q8_accuracy']:.2f}% Q8 accuracy"
+        f"\nPredictions made for {len(ps4_predictor.predictions_dssp3)} sequences "
+        f"in {end - start:.6f} seconds"
     )
+
+    # CB513 Dataset
+    print("\nCB513 Dataset")
+    start = time.perf_counter()
+    cb513_processor = CB513DatasetProcessor.load("cb513_data/cb513_dataset.pt")
+    cb513_predictor = ChouFasmanPredictor(cb513_processor)
+    cb513_predictor.evaluate()
+    end = time.perf_counter()
+    cb513_predictor.print_statistics()
+    cb513_predictor.print_sample(sample_index)
+    print(
+        f"\nPredictions made for {len(cb513_predictor.predictions_dssp3)} sequences "
+        f"in {end - start:.6f} seconds"
+    )
+
+    # Summary
+    print_summary(ps4_predictor.stats, cb513_predictor.stats)
+
+    # Save results
+    save_results(ps4_predictor.stats, cb513_predictor.stats, save_path)
+
+    # Demo loading
+    loaded = load_results(save_path)
+    print("\nLoaded statistics:")
+    print_summary(loaded["ps4"], loaded["cb513"])
 
 
 if __name__ == "__main__":

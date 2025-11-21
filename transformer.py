@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from typing import Dict
 import time
-from protein_dataset_processor import ProteinDatasetProcessor
+from ps4_data.ps4_dataset_processor import ProteinDatasetProcessor
 
 
 class PositionalEncoding(nn.Module):
