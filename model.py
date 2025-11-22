@@ -40,7 +40,7 @@ class ModelConfig:
     epochs: int = 10
     warmup_steps: int = 500
     num_workers: int = 4
-    label_smoothing: float = 0.05   
+    label_smoothing: float = 0.05
     beta1: float = 0.9
     beta2: float = 0.98
     eps: float = 1e-6
@@ -58,7 +58,7 @@ class ModelConfig:
             batch_size=64,
             learning_rate=3e-3,
             epochs=10,
-            warmup_steps=600,   
+            warmup_steps=600,
             lstm_hidden=128,
             lstm_layers=1,
             label_smoothing=0.05,
@@ -176,17 +176,22 @@ class Conv1DFrontEnd(nn.Module):
         super().__init__()
         padding = (kernel_size - 1) // 2
         # Conv1d expects (B, channels, L). We'll apply conv across the sequence length
-        self.conv = nn.Conv1d(in_channels=d_model, out_channels=d_model, kernel_size=kernel_size, padding=padding)
+        self.conv = nn.Conv1d(
+            in_channels=d_model,
+            out_channels=d_model,
+            kernel_size=kernel_size,
+            padding=padding,
+        )
         self.act = nn.GELU()
         self.layernorm = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         # x: (B, L, d_model) -> conv expects (B, d_model, L)
-        x = x.transpose(1, 2)            # (B, d_model, L)
-        x = self.conv(x)                # (B, d_model, L)
+        x = x.transpose(1, 2)  # (B, d_model, L)
+        x = self.conv(x)  # (B, d_model, L)
         x = self.act(x)
-        x = x.transpose(1, 2)           # (B, L, d_model)
+        x = x.transpose(1, 2)  # (B, L, d_model)
         x = self.layernorm(x)
         x = self.dropout(x)
         return x
@@ -246,7 +251,9 @@ class ProteinStructureTransformer(nn.Module):
             config.vocab_size, config.d_model, padding_idx=PAD_IDX
         )
 
-        self.conv_frontend = Conv1DFrontEnd(d_model=config.d_model, kernel_size=5, dropout=config.dropout)
+        self.conv_frontend = Conv1DFrontEnd(
+            d_model=config.d_model, kernel_size=5, dropout=config.dropout
+        )
 
         self.pos_encoding = SinusoidalPositionalEncoding(
             config.d_model, config.max_seq_len, config.dropout
@@ -286,9 +293,9 @@ class ProteinStructureTransformer(nn.Module):
                 nn.init.xavier_uniform_(p)
 
     def forward(self, input_ids, attention_mask):
-        x = self.embedding(input_ids)           # (B, L, d_model)
+        x = self.embedding(input_ids)  # (B, L, d_model)
 
-        x = self.conv_frontend(x)               # (B, L, d_model)
+        x = self.conv_frontend(x)  # (B, L, d_model)
         x = self.pos_encoding(x)
         src_key_padding_mask = ~attention_mask
         x = self.encoder(x, src_key_padding_mask=src_key_padding_mask)
