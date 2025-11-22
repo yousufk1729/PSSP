@@ -1,8 +1,5 @@
-from ps4_data.ps4_dataset_processor import PS4DatasetProcessor
-from cb513_data.cb513_dataset_processor import CB513DatasetProcessor
 import numpy as np
 import torch
-import time
 
 
 class ChouFasmanPredictor:
@@ -220,9 +217,9 @@ def print_summary(ps4_stats, cb513_stats):
 
 
 def main():
-    sample_index = 0
     save_path = "chou_fasman_results.pt"
-
+    """
+    sample_index = 0
     # PS4 Dataset
     print("PS4 Dataset")
     start = time.perf_counter()
@@ -256,7 +253,7 @@ def main():
 
     # Save results
     save_results(ps4_predictor.stats, cb513_predictor.stats, save_path)
-
+    """
     # Demo loading
     loaded = load_results(save_path)
     print("\nLoaded statistics:")
