@@ -1,10 +1,11 @@
 import torch
 from torch import nn
 from torch.nn import functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Sampler
 from torch.amp import autocast, GradScaler
 import math
 import time
+import random
 from typing import List
 from dataclasses import dataclass
 
@@ -38,6 +39,14 @@ class ModelConfig:
     learning_rate: float = 1e-3
     epochs: int = 10
     warmup_steps: int = 500
+    num_workers: int = 4
+    label_smoothing: float = 0.1
+    beta1: float = 0.9
+    beta2: float = 0.98
+    eps: float = 1e-6
+    # BiLSTM classifier params
+    lstm_hidden: int = 256
+    lstm_layers: int = 2
 
     @classmethod
     def quick(cls):
@@ -49,8 +58,10 @@ class ModelConfig:
             dropout=0.1,
             batch_size=64,
             learning_rate=3e-3,
-            epochs=3,
+            epochs=10,
             warmup_steps=100,
+            lstm_hidden=128,
+            lstm_layers=1,
         )
 
     @classmethod
@@ -65,6 +76,8 @@ class ModelConfig:
             learning_rate=1e-3,
             epochs=15,
             warmup_steps=300,
+            lstm_hidden=256,
+            lstm_layers=2,
         )
 
     @classmethod
@@ -79,7 +92,30 @@ class ModelConfig:
             learning_rate=5e-4,
             epochs=50,
             warmup_steps=1000,
+            lstm_hidden=512,
+            lstm_layers=2,
         )
+
+
+class SortedBatchSampler(Sampler):
+    def __init__(self, lengths, batch_size, shuffle=True):
+        self.lengths = lengths
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+
+    def __iter__(self):
+        indices = sorted(range(len(self.lengths)), key=lambda i: self.lengths[i])
+        batches = [
+            indices[i : i + self.batch_size]
+            for i in range(0, len(indices), self.batch_size)
+        ]
+        if self.shuffle:
+            random.shuffle(batches)
+        for batch in batches:
+            yield batch
+
+    def __len__(self):
+        return (len(self.lengths) + self.batch_size - 1) // self.batch_size
 
 
 class ProteinDataset(Dataset):
@@ -102,14 +138,18 @@ class ProteinDataset(Dataset):
 def collate_fn_nested(batch):
     inputs, targets, lengths = zip(*batch)
     max_len = max(lengths)
-    padded_inputs = torch.full((len(inputs), max_len), PAD_IDX, dtype=torch.long)
-    padded_targets = torch.full((len(targets), max_len), PAD_LABEL, dtype=torch.long)
-    attention_mask = torch.zeros((len(inputs), max_len), dtype=torch.bool)
-    for i, (inp, tgt) in enumerate(zip(inputs, targets)):
-        padded_inputs[i, : len(inp)] = inp
-        padded_targets[i, : len(tgt)] = tgt
-        attention_mask[i, : len(inp)] = 1
-    return padded_inputs, padded_targets, attention_mask, lengths
+    batch_size = len(inputs)
+
+    padded_inputs = torch.full((batch_size, max_len), PAD_IDX, dtype=torch.long)
+    padded_targets = torch.full((batch_size, max_len), PAD_LABEL, dtype=torch.long)
+    attention_mask = torch.zeros((batch_size, max_len), dtype=torch.bool)
+
+    for i, (inp, tgt, length) in enumerate(zip(inputs, targets, lengths)):
+        padded_inputs[i, :length] = inp
+        padded_targets[i, :length] = tgt
+        attention_mask[i, :length] = True
+
+    return padded_inputs, padded_targets, attention_mask
 
 
 class SinusoidalPositionalEncoding(nn.Module):
@@ -127,9 +167,58 @@ class SinusoidalPositionalEncoding(nn.Module):
         self.register_buffer("pe", pe)
 
     def forward(self, x):
-        # x: (B, L, d_model)
         x = x + self.pe[: x.size(1)]
         return self.dropout(x)
+
+
+class BiLSTMClassifier(nn.Module):
+    """
+    BiLSTM classification head.
+    Refines transformer output with sequential context before classification.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        num_classes: int,
+        lstm_hidden: int = 256,
+        lstm_layers: int = 2,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+
+        self.bilstm = nn.GRU(
+            input_size=d_model,
+            hidden_size=lstm_hidden,
+            num_layers=lstm_layers,
+            bidirectional=True,
+            batch_first=True,
+            dropout=dropout if lstm_layers > 1 else 0,
+        )
+
+        self.lstm_norm = nn.LayerNorm(lstm_hidden * 2)
+
+        self.classifier = nn.Sequential(
+            nn.Linear(lstm_hidden * 2, lstm_hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(lstm_hidden, num_classes),
+        )
+
+    def forward(self, x, attention_mask=None):
+        if attention_mask is not None:
+            lengths = attention_mask.sum(dim=1).cpu()
+            packed = nn.utils.rnn.pack_padded_sequence(
+                x, lengths, batch_first=True, enforce_sorted=False
+            )
+            packed_out, _ = self.bilstm(packed)
+            x, _ = nn.utils.rnn.pad_packed_sequence(packed_out, batch_first=True)
+        else:
+            x, _ = self.bilstm(x)
+
+        x = self.lstm_norm(x)
+        logits = self.classifier(x)
+        return logits
 
 
 class ProteinStructureTransformer(nn.Module):
@@ -151,68 +240,69 @@ class ProteinStructureTransformer(nn.Module):
             dropout=config.dropout,
             activation="gelu",
             batch_first=True,
-            norm_first=False,
+            norm_first=True,
             bias=True,
         )
         self.encoder = nn.TransformerEncoder(
             encoder_layer,
             num_layers=config.n_layers,
-            norm=None,
-            enable_nested_tensor=True,
+            norm=nn.LayerNorm(config.d_model),
+            enable_nested_tensor=False,
             mask_check=False,
         )
 
-        self.classifier = nn.Linear(config.d_model, config.num_classes)
+        # BiLSTM classifier instead of single Linear
+        self.classifier = BiLSTMClassifier(
+            d_model=config.d_model,
+            num_classes=config.num_classes,
+            lstm_hidden=config.lstm_hidden,
+            lstm_layers=config.lstm_layers,
+            dropout=config.dropout,
+        )
+
         self._init_weights()
 
     def _init_weights(self):
-        for p in self.parameters():
-            if p.dim() > 1:
+        for name, p in self.named_parameters():
+            if p.dim() > 1 and "bilstm" not in name:
                 nn.init.xavier_uniform_(p)
 
     def forward(self, input_ids, attention_mask):
-        # input_ids: (B, L), attention_mask: (B, L)
         x = self.embedding(input_ids)
         x = self.pos_encoding(x)
-        # Transformer expects mask: True for positions to mask (i.e., padding)
-        src_key_padding_mask = ~attention_mask.bool()
+        src_key_padding_mask = ~attention_mask
         x = self.encoder(x, src_key_padding_mask=src_key_padding_mask)
-        logits = self.classifier(x)
-        seq_lens = attention_mask.sum(dim=1).tolist()
-        return logits, seq_lens
+        logits = self.classifier(x, attention_mask)
+        return logits
 
 
-def compute_metrics(logits, padded_targets, seq_lens):
+def compute_metrics(logits, padded_targets, attention_mask):
     preds = logits.argmax(dim=-1)
-
-    correct = 0
-    total = 0
-    for i, length in enumerate(seq_lens):
-        correct += (preds[i, :length] == padded_targets[i, :length]).sum().item()
-        total += length
-
+    correct = ((preds == padded_targets) & attention_mask).sum().item()
+    total = attention_mask.sum().item()
     return correct / total if total > 0 else 0.0
 
 
-def train_epoch(model, loader, optimizer, scheduler, scaler, device):
+def train_epoch(model, loader, optimizer, scheduler, scaler, device, label_smoothing):
     model.train()
-    total_loss = 0
-    total_acc = 0
+    total_loss = 0.0
+    total_acc = 0.0
     n_batches = 0
 
-    for padded_inputs, padded_targets, attention_mask, lengths in loader:
-        padded_inputs = padded_inputs.to(device)
-        padded_targets = padded_targets.to(device)
-        attention_mask = attention_mask.to(device)
+    for padded_inputs, padded_targets, attention_mask in loader:
+        padded_inputs = padded_inputs.to(device, non_blocking=True)
+        padded_targets = padded_targets.to(device, non_blocking=True)
+        attention_mask = attention_mask.to(device, non_blocking=True)
 
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
 
         with autocast("cuda", dtype=torch.float16):
-            logits, seq_lens = model(padded_inputs, attention_mask)
+            logits = model(padded_inputs, attention_mask)
             loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)),
                 padded_targets.view(-1),
                 ignore_index=PAD_LABEL,
+                label_smoothing=label_smoothing,
             )
 
         scaler.scale(loss).backward()
@@ -223,7 +313,7 @@ def train_epoch(model, loader, optimizer, scheduler, scaler, device):
         scheduler.step()
 
         total_loss += loss.item()
-        total_acc += compute_metrics(logits, padded_targets, seq_lens)
+        total_acc += compute_metrics(logits, padded_targets, attention_mask)
         n_batches += 1
 
     return total_loss / n_batches, total_acc / n_batches
@@ -232,17 +322,17 @@ def train_epoch(model, loader, optimizer, scheduler, scaler, device):
 @torch.no_grad()
 def evaluate(model, loader, device):
     model.eval()
-    total_loss = 0
-    total_acc = 0
+    total_loss = 0.0
+    total_acc = 0.0
     n_batches = 0
 
-    for padded_inputs, padded_targets, attention_mask, lengths in loader:
-        padded_inputs = padded_inputs.to(device)
-        padded_targets = padded_targets.to(device)
-        attention_mask = attention_mask.to(device)
+    for padded_inputs, padded_targets, attention_mask in loader:
+        padded_inputs = padded_inputs.to(device, non_blocking=True)
+        padded_targets = padded_targets.to(device, non_blocking=True)
+        attention_mask = attention_mask.to(device, non_blocking=True)
 
         with autocast("cuda", dtype=torch.float16):
-            logits, seq_lens = model(padded_inputs, attention_mask)
+            logits = model(padded_inputs, attention_mask)
             loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)),
                 padded_targets.view(-1),
@@ -250,7 +340,7 @@ def evaluate(model, loader, device):
             )
 
         total_loss += loss.item()
-        total_acc += compute_metrics(logits, padded_targets, seq_lens)
+        total_acc += compute_metrics(logits, padded_targets, attention_mask)
         n_batches += 1
 
     return total_loss / n_batches, total_acc / n_batches
@@ -269,28 +359,39 @@ def get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps):
 def train(config: ModelConfig, train_dataset, val_dataset, device):
     print("\nTraining Configuration:")
     print(
-        f"d_model: {config.d_model}, n_heads: {config.n_heads}, n_layers: {config.n_layers}"
+        f"  d_model: {config.d_model}, n_heads: {config.n_heads}, n_layers: {config.n_layers}"
     )
-    print(f"d_ff: {config.d_ff}, dropout: {config.dropout}")
+    print(f"  d_ff: {config.d_ff}, dropout: {config.dropout}")
     print(
-        f"batch_size: {config.batch_size}, lr: {config.learning_rate}, epochs: {config.epochs}"
+        f"  batch_size: {config.batch_size}, lr: {config.learning_rate}, epochs: {config.epochs}"
+    )
+    print(f"  label_smoothing: {config.label_smoothing}")
+    print(f"  AdamW betas: ({config.beta1}, {config.beta2}), eps: {config.eps}")
+    print(f"  BiLSTM: hidden={config.lstm_hidden}, layers={config.lstm_layers}")
+    print(f"  num_workers: {config.num_workers}")
+
+    train_sampler = SortedBatchSampler(
+        train_dataset.lengths, config.batch_size, shuffle=True
+    )
+    val_sampler = SortedBatchSampler(
+        val_dataset.lengths, config.batch_size, shuffle=False
     )
 
     train_loader = DataLoader(
         train_dataset,
-        batch_size=config.batch_size,
-        shuffle=True,
+        batch_sampler=train_sampler,
         collate_fn=collate_fn_nested,
-        num_workers=0,
+        num_workers=config.num_workers,
         pin_memory=True,
+        persistent_workers=config.num_workers > 0,
     )
     val_loader = DataLoader(
         val_dataset,
-        batch_size=config.batch_size,
-        shuffle=False,
+        batch_sampler=val_sampler,
         collate_fn=collate_fn_nested,
-        num_workers=0,
+        num_workers=config.num_workers,
         pin_memory=True,
+        persistent_workers=config.num_workers > 0,
     )
 
     model = ProteinStructureTransformer(config).to(device)
@@ -298,7 +399,12 @@ def train(config: ModelConfig, train_dataset, val_dataset, device):
     print(f"  Model parameters: {n_params:,}")
 
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=config.learning_rate, weight_decay=0.01
+        model.parameters(),
+        lr=config.learning_rate,
+        betas=(config.beta1, config.beta2),
+        eps=config.eps,
+        weight_decay=0.01,
+        fused=True,
     )
     total_steps = len(train_loader) * config.epochs
     scheduler = get_cosine_schedule_with_warmup(
@@ -306,7 +412,7 @@ def train(config: ModelConfig, train_dataset, val_dataset, device):
     )
     scaler = GradScaler("cuda")
 
-    best_val_acc = 0
+    best_val_acc = 0.0
     best_model_state = None
     start_time = time.time()
 
@@ -316,7 +422,13 @@ def train(config: ModelConfig, train_dataset, val_dataset, device):
         epoch_start = time.time()
 
         train_loss, train_acc = train_epoch(
-            model, train_loader, optimizer, scheduler, scaler, device
+            model,
+            train_loader,
+            optimizer,
+            scheduler,
+            scaler,
+            device,
+            config.label_smoothing,
         )
         val_loss, val_acc = evaluate(model, val_loader, device)
 
@@ -348,13 +460,11 @@ def predict_sequence(model, sequence: str, device) -> str:
     input_ids = torch.tensor(
         [AA_TO_IDX.get(c, AA_TO_IDX["X"]) for c in sequence], dtype=torch.long
     )
-    padded_input = input_ids.unsqueeze(0)
-    attention_mask = torch.ones_like(padded_input, dtype=torch.bool)
-    padded_input = padded_input.to(device)
-    attention_mask = attention_mask.to(device)
+    padded_input = input_ids.unsqueeze(0).to(device)
+    attention_mask = torch.ones_like(padded_input, dtype=torch.bool, device=device)
 
-    with torch.no_grad():
-        logits, _ = model(padded_input, attention_mask)
+    with torch.no_grad(), autocast("cuda", dtype=torch.float16):
+        logits = model(padded_input, attention_mask)
 
     preds = logits[0, : len(sequence)].argmax(dim=-1)
     return "".join(IDX_TO_DSSP8[p.item()] for p in preds)
@@ -363,6 +473,10 @@ def predict_sequence(model, sequence: str, device) -> str:
 def main():
     device = torch.device("cuda")
     torch.manual_seed(1729)
+
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.enable_flash_sdp(True)
+    torch.set_float32_matmul_precision("high")
 
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
@@ -403,12 +517,15 @@ def main():
 
     model = train(config, train_dataset, val_dataset, device)
 
+    test_sampler = SortedBatchSampler(
+        test_dataset.lengths, config.batch_size, shuffle=False
+    )
     test_loader = DataLoader(
         test_dataset,
-        batch_size=config.batch_size,
-        shuffle=False,
+        batch_sampler=test_sampler,
         collate_fn=collate_fn_nested,
-        num_workers=0,
+        num_workers=config.num_workers,
+        pin_memory=True,
     )
 
     test_loss, test_acc = evaluate(model, test_loader, device)
