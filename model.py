@@ -6,6 +6,7 @@ from torch.amp import autocast, GradScaler
 import math
 import time
 import random
+import os
 from typing import List
 from dataclasses import dataclass
 
@@ -44,6 +45,9 @@ class ModelConfig:
     lstm_hidden: int = 128
     lstm_layers: int = 1
 
+    patience: int = 5
+    checkpoint_dir: str = "checkpoints"
+
     @classmethod
     def quick(cls):
         return cls(
@@ -59,6 +63,7 @@ class ModelConfig:
             lstm_hidden=128,
             lstm_layers=1,
             label_smoothing=0.05,
+            patience=5,
         )
 
     @classmethod
@@ -66,16 +71,17 @@ class ModelConfig:
         return cls(
             d_model=128,
             n_heads=4,
-            n_layers=4,
+            n_layers=3,
             d_ff=512,
-            dropout=0.1,
+            dropout=0.2,
             batch_size=32,
             learning_rate=1e-3,
-            epochs=15,
+            epochs=25,
             warmup_steps=1000,
             lstm_hidden=256,
             lstm_layers=2,
-            label_smoothing=0.05,
+            label_smoothing=0.1,
+            patience=3,
         )
 
     @classmethod
@@ -85,14 +91,15 @@ class ModelConfig:
             n_heads=8,
             n_layers=6,
             d_ff=1024,
-            dropout=0.1,
+            dropout=0.2,
             batch_size=16,
             learning_rate=5e-4,
             epochs=50,
             warmup_steps=1000,
             lstm_hidden=512,
             lstm_layers=2,
-            label_smoothing=0.05,
+            label_smoothing=0.1,
+            patience=10,
         )
 
 
@@ -163,14 +170,7 @@ class LearnablePositionalEncoding(nn.Module):
 
 
 class BiLSTMClassifier(nn.Module):
-    def __init__(
-        self,
-        d_model,
-        num_classes,
-        lstm_hidden,
-        lstm_layers,
-        dropout,
-    ):
+    def __init__(self, d_model, num_classes, lstm_hidden, lstm_layers, dropout):
         super().__init__()
         self.bilstm = nn.LSTM(
             input_size=d_model,
@@ -256,6 +256,52 @@ class ProteinStructureTransformerESM(nn.Module):
         src_key_padding_mask = ~attention_mask
         x = self.encoder(x, src_key_padding_mask=src_key_padding_mask)
         return self.classifier(x, attention_mask)
+
+
+class EarlyStopping:
+    def __init__(self, patience, min_delta=0.0):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.best_score = None
+        self.counter = 0
+        self.should_stop = False
+
+    def __call__(self, val_acc):
+        if self.best_score is None:
+            self.best_score = val_acc
+        elif val_acc < self.best_score + self.min_delta:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.should_stop = True
+        else:
+            self.best_score = val_acc
+            self.counter = 0
+        return self.should_stop
+
+
+def save_checkpoint(model, optimizer, scheduler, scaler, epoch, val_acc, config, path):
+    checkpoint = {
+        "epoch": epoch,
+        "model_state": model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "scheduler_state": scheduler.state_dict(),
+        "scaler_state": scaler.state_dict(),
+        "val_acc": val_acc,
+        "config": config,
+    }
+    torch.save(checkpoint, path)
+
+
+def load_checkpoint(path, model, optimizer=None, scheduler=None, scaler=None):
+    checkpoint = torch.load(path, weights_only=False)
+    model.load_state_dict(checkpoint["model_state"])
+    if optimizer is not None:
+        optimizer.load_state_dict(checkpoint["optimizer_state"])
+    if scheduler is not None:
+        scheduler.load_state_dict(checkpoint["scheduler_state"])
+    if scaler is not None:
+        scaler.load_state_dict(checkpoint["scaler_state"])
+    return checkpoint["epoch"], checkpoint["val_acc"]
 
 
 def compute_metrics(logits, padded_targets, attention_mask):
@@ -344,6 +390,9 @@ def train(config, train_dataset, val_dataset, device):
         f"batch_size: {config.batch_size}, lr: {config.learning_rate}, epochs: {config.epochs}"
     )
     print(f"BiLSTM: hidden={config.lstm_hidden}, layers={config.lstm_layers}")
+    print(f"Early stopping patience: {config.patience}")
+
+    os.makedirs(config.checkpoint_dir, exist_ok=True)
 
     train_sampler = SortedBatchSampler(
         train_dataset.lengths, config.batch_size, shuffle=True
@@ -387,6 +436,7 @@ def train(config, train_dataset, val_dataset, device):
     )
     scaler = GradScaler("cuda")
 
+    early_stopping = EarlyStopping(patience=config.patience)
     best_val_acc = 0.0
     best_model_state = None
     start_time = time.time()
@@ -407,21 +457,40 @@ def train(config, train_dataset, val_dataset, device):
         val_loss, val_acc = evaluate(model, val_loader, device)
         epoch_time = time.time() - epoch_start
 
-        if val_acc > best_val_acc:
+        improved = val_acc > best_val_acc
+        if improved:
             best_val_acc = val_acc
             best_model_state = {
                 k: v.cpu().clone() for k, v in model.state_dict().items()
             }
+            best_path = os.path.join(config.checkpoint_dir, "best_model.pt")
+            save_checkpoint(
+                model, optimizer, scheduler, scaler, epoch, val_acc, config, best_path
+            )
 
+        checkpoint_path = os.path.join(
+            config.checkpoint_dir, f"checkpoint_epoch_{epoch + 1:03d}.pt"
+        )
+        save_checkpoint(
+            model, optimizer, scheduler, scaler, epoch, val_acc, config, checkpoint_path
+        )
+
+        status = " *" if improved else ""
         print(
             f"Epoch {epoch + 1:3d}/{config.epochs} | "
             f"Train Loss: {train_loss:.4f} Acc: {train_acc:.4f} | "
             f"Val Loss: {val_loss:.4f} Acc: {val_acc:.4f} | "
-            f"Time: {epoch_time:.1f}s"
+            f"Time: {epoch_time:.1f}s{status}"
         )
+
+        if early_stopping(val_acc):
+            print(f"\nEarly stopping triggered after {epoch + 1} epochs")
+            print(f"No improvement for {config.patience} consecutive epochs")
+            break
 
     print(f"\nBest validation accuracy: {best_val_acc:.4f}")
     print(f"Total training time: {(time.time() - start_time) / 60:.1f} minutes")
+    print(f"Checkpoints saved to: {config.checkpoint_dir}/")
 
     model.load_state_dict(best_model_state)
     return model
@@ -445,7 +514,7 @@ def main():
     cb513_emb = ESMEmbeddings.load("cb513_data/cb513_esm_embeddings.pt")
 
     n_total = len(ps4.input_seqs)
-    n_val = int(0.2 * n_total)
+    n_val = int(0.1 * n_total)
     indices = torch.randperm(n_total).tolist()
     train_idx, val_idx = indices[n_val:], indices[:n_val]
 
