@@ -40,11 +40,10 @@ class ModelConfig:
     epochs: int = 10
     warmup_steps: int = 500
     num_workers: int = 4
-    label_smoothing: float = 0.1
+    label_smoothing: float = 0.05   
     beta1: float = 0.9
     beta2: float = 0.98
     eps: float = 1e-6
-    # BiLSTM classifier params
     lstm_hidden: int = 256
     lstm_layers: int = 2
 
@@ -59,9 +58,10 @@ class ModelConfig:
             batch_size=64,
             learning_rate=3e-3,
             epochs=10,
-            warmup_steps=100,
+            warmup_steps=600,   
             lstm_hidden=128,
             lstm_layers=1,
+            label_smoothing=0.05,
         )
 
     @classmethod
@@ -171,12 +171,28 @@ class SinusoidalPositionalEncoding(nn.Module):
         return self.dropout(x)
 
 
-class BiLSTMClassifier(nn.Module):
-    """
-    BiLSTM classification head.
-    Refines transformer output with sequential context before classification.
-    """
+class Conv1DFrontEnd(nn.Module):
+    def __init__(self, d_model: int, kernel_size: int = 5, dropout: float = 0.0):
+        super().__init__()
+        padding = (kernel_size - 1) // 2
+        # Conv1d expects (B, channels, L). We'll apply conv across the sequence length
+        self.conv = nn.Conv1d(in_channels=d_model, out_channels=d_model, kernel_size=kernel_size, padding=padding)
+        self.act = nn.GELU()
+        self.layernorm = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
 
+    def forward(self, x):
+        # x: (B, L, d_model) -> conv expects (B, d_model, L)
+        x = x.transpose(1, 2)            # (B, d_model, L)
+        x = self.conv(x)                # (B, d_model, L)
+        x = self.act(x)
+        x = x.transpose(1, 2)           # (B, L, d_model)
+        x = self.layernorm(x)
+        x = self.dropout(x)
+        return x
+
+
+class BiLSTMClassifier(nn.Module):
     def __init__(
         self,
         d_model: int,
@@ -229,6 +245,9 @@ class ProteinStructureTransformer(nn.Module):
         self.embedding = nn.Embedding(
             config.vocab_size, config.d_model, padding_idx=PAD_IDX
         )
+
+        self.conv_frontend = Conv1DFrontEnd(d_model=config.d_model, kernel_size=5, dropout=config.dropout)
+
         self.pos_encoding = SinusoidalPositionalEncoding(
             config.d_model, config.max_seq_len, config.dropout
         )
@@ -251,7 +270,6 @@ class ProteinStructureTransformer(nn.Module):
             mask_check=False,
         )
 
-        # BiLSTM classifier instead of single Linear
         self.classifier = BiLSTMClassifier(
             d_model=config.d_model,
             num_classes=config.num_classes,
@@ -268,7 +286,9 @@ class ProteinStructureTransformer(nn.Module):
                 nn.init.xavier_uniform_(p)
 
     def forward(self, input_ids, attention_mask):
-        x = self.embedding(input_ids)
+        x = self.embedding(input_ids)           # (B, L, d_model)
+
+        x = self.conv_frontend(x)               # (B, L, d_model)
         x = self.pos_encoding(x)
         src_key_padding_mask = ~attention_mask
         x = self.encoder(x, src_key_padding_mask=src_key_padding_mask)
@@ -359,16 +379,16 @@ def get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps):
 def train(config: ModelConfig, train_dataset, val_dataset, device):
     print("\nTraining Configuration:")
     print(
-        f"  d_model: {config.d_model}, n_heads: {config.n_heads}, n_layers: {config.n_layers}"
+        f"d_model: {config.d_model}, n_heads: {config.n_heads}, n_layers: {config.n_layers}"
     )
-    print(f"  d_ff: {config.d_ff}, dropout: {config.dropout}")
+    print(f"d_ff: {config.d_ff}, dropout: {config.dropout}")
     print(
-        f"  batch_size: {config.batch_size}, lr: {config.learning_rate}, epochs: {config.epochs}"
+        f"batch_size: {config.batch_size}, lr: {config.learning_rate}, epochs: {config.epochs}"
     )
-    print(f"  label_smoothing: {config.label_smoothing}")
-    print(f"  AdamW betas: ({config.beta1}, {config.beta2}), eps: {config.eps}")
-    print(f"  BiLSTM: hidden={config.lstm_hidden}, layers={config.lstm_layers}")
-    print(f"  num_workers: {config.num_workers}")
+    print(f"label_smoothing: {config.label_smoothing}")
+    print(f"AdamW betas: ({config.beta1}, {config.beta2}), eps: {config.eps}")
+    print(f"BiLSTM: hidden={config.lstm_hidden}, layers={config.lstm_layers}")
+    print(f"num_workers: {config.num_workers}")
 
     train_sampler = SortedBatchSampler(
         train_dataset.lengths, config.batch_size, shuffle=True
