@@ -1,5 +1,5 @@
 # PSSP
 
-Encoder-only transformer to perform both three-state and eight-state protein secondary structure prediction. For APS360 at UofT
+Transformer-CNN-BiGRU to perform both three-state and eight-state protein secondary structure prediction. For APS360 at UofT. 
 
-[Progress Report](https://github.com/user-attachments/files/23372045/YousufKhanAPS360ProjectProgressReport.1.pdf)
+[Final Report](https://drive.google.com/file/d/1TFLwkQe3lX_hjeFfkHeW4dd4pO8o4G-_/view?usp=sharing)
