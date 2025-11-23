@@ -1,5 +1,9 @@
 import numpy as np
+import time
 import torch
+
+from ps4_data.ps4_dataset_processor import PS4DatasetProcessor
+from cb513_data.cb513_dataset_processor import CB513DatasetProcessor
 
 
 class ChouFasmanPredictor:
@@ -200,7 +204,7 @@ def load_results(pt_path="chou_fasman_results.pt"):
 
 def print_summary(ps4_stats, cb513_stats):
     print(
-        f"\n{'Dataset':<12} {'Proteins':>10} {'Residues':>12} {'Q3 Acc':>10} {'Q8 Acc':>10}"
+        f"{'Dataset':<12} {'Proteins':>10} {'Residues':>12} {'Q3 Acc':>10} {'Q8 Acc':>10}"
     )
     print(
         f"{'PS4':<12} {ps4_stats['total_proteins']:>10} "
@@ -218,9 +222,8 @@ def print_summary(ps4_stats, cb513_stats):
 
 def main():
     save_path = "chou_fasman_results.pt"
-    """
+
     sample_index = 0
-    # PS4 Dataset
     print("PS4 Dataset")
     start = time.perf_counter()
     ps4_processor = PS4DatasetProcessor.load("ps4_data/ps4_dataset.pt")
@@ -234,7 +237,6 @@ def main():
         f"in {end - start:.6f} seconds"
     )
 
-    # CB513 Dataset
     print("\nCB513 Dataset")
     start = time.perf_counter()
     cb513_processor = CB513DatasetProcessor.load("cb513_data/cb513_dataset.pt")
@@ -248,15 +250,11 @@ def main():
         f"in {end - start:.6f} seconds"
     )
 
-    # Summary
     print_summary(ps4_predictor.stats, cb513_predictor.stats)
 
-    # Save results
     save_results(ps4_predictor.stats, cb513_predictor.stats, save_path)
-    """
-    # Demo loading
+
     loaded = load_results(save_path)
-    print("\nLoaded statistics:")
     print_summary(loaded["ps4"], loaded["cb513"])
 
 

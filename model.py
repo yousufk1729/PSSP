@@ -2,7 +2,6 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from torch.utils.data import Dataset, DataLoader, Sampler
-from torch.amp import autocast, GradScaler
 import math
 import time
 import random
@@ -25,82 +24,25 @@ PAD_LABEL = -100
 class ModelConfig:
     esm_dim: int = 320
     num_classes: int = 8
-    max_seq_len: int = 1723  # Hardcoded max length from PS4
+    max_seq_len: int = 1723
     num_workers: int = 4
 
-    beta1: float = 0.9
-    beta2: float = 0.98
-    eps: float = 1e-6
+    d_model: int = 320
+    d_reduced: int = 128
+    n_heads: int = 4
+    n_layers: int = 3
+    d_ff: int = 4 * d_model
+    dropout: float = 0.2
+    batch_size: int = 32
+    learning_rate: float = 1e-3
+    epochs: int = 25
+    warmup_steps: int = 500
+    label_smoothing: float = 0.1
+    gru_hidden: int = 128
+    gru_layers: int = 2
 
-    d_model: int = 64
-    n_heads: int = 2
-    n_layers: int = 2
-    d_ff: int = 256
-    dropout: float = 0.1
-    batch_size: int = 64
-    learning_rate: float = 3e-3
-    epochs: int = 10
-    warmup_steps: int = 600
-    label_smoothing: float = 0.05
-    lstm_hidden: int = 128
-    lstm_layers: int = 1
-
-    patience: int = 5
+    patience: int = 10
     checkpoint_dir: str = "checkpoints"
-
-    @classmethod
-    def quick(cls):
-        return cls(
-            d_model=64,
-            n_heads=2,
-            n_layers=2,
-            d_ff=256,
-            dropout=0.1,
-            batch_size=64,
-            learning_rate=3e-3,
-            epochs=10,
-            warmup_steps=600,
-            lstm_hidden=128,
-            lstm_layers=1,
-            label_smoothing=0.05,
-            patience=5,
-        )
-
-    @classmethod
-    def medium(cls):
-        return cls(
-            d_model=128,
-            n_heads=4,
-            n_layers=3,
-            d_ff=512,
-            dropout=0.2,
-            batch_size=32,
-            learning_rate=1e-3,
-            epochs=25,
-            warmup_steps=1000,
-            lstm_hidden=256,
-            lstm_layers=2,
-            label_smoothing=0.1,
-            patience=3,
-        )
-
-    @classmethod
-    def full(cls):
-        return cls(
-            d_model=256,
-            n_heads=8,
-            n_layers=6,
-            d_ff=1024,
-            dropout=0.2,
-            batch_size=16,
-            learning_rate=5e-4,
-            epochs=50,
-            warmup_steps=1000,
-            lstm_hidden=512,
-            lstm_layers=2,
-            label_smoothing=0.1,
-            patience=10,
-        )
 
 
 class SortedBatchSampler(Sampler):
@@ -169,23 +111,53 @@ class LearnablePositionalEncoding(nn.Module):
         return self.dropout(x)
 
 
-class BiLSTMClassifier(nn.Module):
-    def __init__(self, d_model, num_classes, lstm_hidden, lstm_layers, dropout):
+class CNNBlock(nn.Module):
+    def __init__(self, d_model, dropout):
         super().__init__()
-        self.bilstm = nn.LSTM(
+        self.conv1 = nn.Conv1d(d_model, d_model, kernel_size=7, padding=3)
+        self.conv2 = nn.Conv1d(d_model, d_model, kernel_size=7, padding=3)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+        self.activation = nn.GELU()
+
+    def forward(self, x):
+        # x: (batch, seq_len, d_model)
+        residual = x
+        # First conv block
+        x = x.transpose(1, 2)  # (batch, d_model, seq_len)
+        x = self.conv1(x)
+        x = x.transpose(1, 2)  # (batch, seq_len, d_model)
+        x = self.norm1(x)
+        x = self.activation(x)
+        x = self.dropout(x)
+        # Second conv block with residual
+        x = x.transpose(1, 2)
+        x = self.conv2(x)
+        x = x.transpose(1, 2)
+        x = self.norm2(x)
+        x = self.activation(x)
+        x = self.dropout(x)
+        return x + residual
+
+
+class BiGRUClassifier(nn.Module):
+    def __init__(self, d_model, num_classes, gru_hidden, gru_layers, dropout):
+        super().__init__()
+        self.bigru = nn.GRU(
             input_size=d_model,
-            hidden_size=lstm_hidden,
-            num_layers=lstm_layers,
+            hidden_size=gru_hidden,
+            num_layers=gru_layers,
             bidirectional=True,
             batch_first=True,
-            dropout=dropout if lstm_layers > 1 else 0,
+            dropout=dropout if gru_layers > 1 else 0,
         )
-        self.lstm_norm = nn.LayerNorm(lstm_hidden * 2)
+        self.gru_norm = nn.LayerNorm(gru_hidden * 2)
         self.classifier = nn.Sequential(
-            nn.Linear(lstm_hidden * 2, lstm_hidden),
+            nn.Linear(gru_hidden * 2, gru_hidden),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(lstm_hidden, num_classes),
+            nn.Linear(gru_hidden, num_classes),
         )
 
     def forward(self, x, attention_mask=None):
@@ -194,31 +166,32 @@ class BiLSTMClassifier(nn.Module):
             packed = nn.utils.rnn.pack_padded_sequence(
                 x, lengths, batch_first=True, enforce_sorted=False
             )
-            packed_out, _ = self.bilstm(packed)
+            packed_out, _ = self.bigru(packed)
             x, _ = nn.utils.rnn.pad_packed_sequence(packed_out, batch_first=True)
         else:
-            x, _ = self.bilstm(x)
-        x = self.lstm_norm(x)
+            x, _ = self.bigru(x)
+        x = self.gru_norm(x)
         return self.classifier(x)
 
 
-class ProteinStructureTransformerESM(nn.Module):
+class TCGNet(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
 
-        self.input_proj = nn.Sequential(
-            nn.Linear(config.esm_dim, config.d_model),
-            nn.LayerNorm(config.d_model),
+        self.projection = nn.Sequential(
+            nn.Linear(config.d_model, config.d_reduced),
+            nn.LayerNorm(config.d_reduced),
+            nn.GELU(),
             nn.Dropout(config.dropout),
         )
 
         self.pos_encoding = LearnablePositionalEncoding(
-            config.d_model, config.max_seq_len, config.dropout
+            config.d_reduced, config.max_seq_len, config.dropout
         )
 
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=config.d_model,
+            d_model=config.d_reduced,
             nhead=config.n_heads,
             dim_feedforward=config.d_ff,
             dropout=config.dropout,
@@ -230,16 +203,18 @@ class ProteinStructureTransformerESM(nn.Module):
         self.encoder = nn.TransformerEncoder(
             encoder_layer,
             num_layers=config.n_layers,
-            norm=nn.LayerNorm(config.d_model),
+            norm=nn.LayerNorm(config.d_reduced),
             enable_nested_tensor=False,
             mask_check=False,
         )
 
-        self.classifier = BiLSTMClassifier(
-            d_model=config.d_model,
+        self.cnn = CNNBlock(config.d_reduced, config.dropout)
+
+        self.classifier = BiGRUClassifier(
+            d_model=config.d_reduced,
             num_classes=config.num_classes,
-            lstm_hidden=config.lstm_hidden,
-            lstm_layers=config.lstm_layers,
+            gru_hidden=config.gru_hidden,
+            gru_layers=config.gru_layers,
             dropout=config.dropout,
         )
 
@@ -247,14 +222,15 @@ class ProteinStructureTransformerESM(nn.Module):
 
     def _init_weights(self):
         for name, p in self.named_parameters():
-            if p.dim() > 1 and "bilstm" not in name and "pe" not in name:
+            if p.dim() > 1 and "bigru" not in name and "pe" not in name:
                 nn.init.xavier_uniform_(p)
 
     def forward(self, esm_embeddings, attention_mask):
-        x = self.input_proj(esm_embeddings)
+        x = self.projection(esm_embeddings)
         x = self.pos_encoding(x)
         src_key_padding_mask = ~attention_mask
         x = self.encoder(x, src_key_padding_mask=src_key_padding_mask)
+        x = self.cnn(x)
         return self.classifier(x, attention_mask)
 
 
@@ -279,28 +255,29 @@ class EarlyStopping:
         return self.should_stop
 
 
-def save_checkpoint(model, optimizer, scheduler, scaler, epoch, val_acc, config, path):
+def save_checkpoint(
+    model, optimizer, scheduler, epoch, val_acc, test_acc, config, path
+):
     checkpoint = {
         "epoch": epoch,
         "model_state": model.state_dict(),
         "optimizer_state": optimizer.state_dict(),
         "scheduler_state": scheduler.state_dict(),
-        "scaler_state": scaler.state_dict(),
         "val_acc": val_acc,
+        "test_acc": test_acc,
         "config": config,
     }
     torch.save(checkpoint, path)
+    print(f"Checkpoint saved: {path}")
 
 
-def load_checkpoint(path, model, optimizer=None, scheduler=None, scaler=None):
+def load_checkpoint(path, model, optimizer=None, scheduler=None):
     checkpoint = torch.load(path, weights_only=False)
     model.load_state_dict(checkpoint["model_state"])
     if optimizer is not None:
         optimizer.load_state_dict(checkpoint["optimizer_state"])
     if scheduler is not None:
         scheduler.load_state_dict(checkpoint["scheduler_state"])
-    if scaler is not None:
-        scaler.load_state_dict(checkpoint["scaler_state"])
     return checkpoint["epoch"], checkpoint["val_acc"]
 
 
@@ -311,7 +288,7 @@ def compute_metrics(logits, padded_targets, attention_mask):
     return correct / total if total > 0 else 0.0
 
 
-def train_epoch(model, loader, optimizer, scheduler, scaler, device, label_smoothing):
+def train_epoch(model, loader, optimizer, scheduler, device, label_smoothing):
     model.train()
     total_loss, total_acc, n_batches = 0.0, 0.0, 0
 
@@ -322,20 +299,18 @@ def train_epoch(model, loader, optimizer, scheduler, scaler, device, label_smoot
 
         optimizer.zero_grad(set_to_none=True)
 
-        with autocast("cuda", dtype=torch.float16):
-            logits = model(padded_emb, attention_mask)
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                padded_targets.view(-1),
-                ignore_index=PAD_LABEL,
-                label_smoothing=label_smoothing,
-            )
+        logits = model(padded_emb, attention_mask)
 
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
+        loss = F.cross_entropy(
+            logits.view(-1, logits.size(-1)),
+            padded_targets.view(-1),
+            ignore_index=PAD_LABEL,
+            label_smoothing=label_smoothing,
+        )
+
+        loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        scaler.step(optimizer)
-        scaler.update()
+        optimizer.step()
         scheduler.step()
 
         total_loss += loss.item()
@@ -355,13 +330,13 @@ def evaluate(model, loader, device):
         padded_targets = padded_targets.to(device, non_blocking=True)
         attention_mask = attention_mask.to(device, non_blocking=True)
 
-        with autocast("cuda", dtype=torch.float16):
-            logits = model(padded_emb, attention_mask)
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                padded_targets.view(-1),
-                ignore_index=PAD_LABEL,
-            )
+        logits = model(padded_emb, attention_mask)
+
+        loss = F.cross_entropy(
+            logits.view(-1, logits.size(-1)),
+            padded_targets.view(-1),
+            ignore_index=PAD_LABEL,
+        )
 
         total_loss += loss.item()
         total_acc += compute_metrics(logits, padded_targets, attention_mask)
@@ -380,18 +355,7 @@ def get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
-def train(config, train_dataset, val_dataset, device):
-    print("\nTraining Configuration")
-    print(f"ESM dim: {config.esm_dim} -> d_model: {config.d_model}")
-    print(
-        f"n_heads: {config.n_heads}, n_layers: {config.n_layers}, d_ff: {config.d_ff}"
-    )
-    print(
-        f"batch_size: {config.batch_size}, lr: {config.learning_rate}, epochs: {config.epochs}"
-    )
-    print(f"BiLSTM: hidden={config.lstm_hidden}, layers={config.lstm_layers}")
-    print(f"Early stopping patience: {config.patience}")
-
+def train(config, train_dataset, val_dataset, test_dataset, device):
     os.makedirs(config.checkpoint_dir, exist_ok=True)
 
     train_sampler = SortedBatchSampler(
@@ -399,6 +363,9 @@ def train(config, train_dataset, val_dataset, device):
     )
     val_sampler = SortedBatchSampler(
         val_dataset.lengths, config.batch_size, shuffle=False
+    )
+    test_sampler = SortedBatchSampler(
+        test_dataset.lengths, config.batch_size, shuffle=False
     )
 
     train_loader = DataLoader(
@@ -417,16 +384,22 @@ def train(config, train_dataset, val_dataset, device):
         pin_memory=True,
         persistent_workers=config.num_workers > 0,
     )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_sampler=test_sampler,
+        collate_fn=collate_fn,
+        num_workers=config.num_workers,
+        pin_memory=True,
+        persistent_workers=config.num_workers > 0,
+    )
 
-    model = ProteinStructureTransformerESM(config).to(device)
+    model = TCGNet(config).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model parameters: {n_params:,}")
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=config.learning_rate,
-        betas=(config.beta1, config.beta2),
-        eps=config.eps,
         weight_decay=0.01,
         fused=True,
     )
@@ -434,7 +407,6 @@ def train(config, train_dataset, val_dataset, device):
     scheduler = get_cosine_schedule_with_warmup(
         optimizer, config.warmup_steps, total_steps
     )
-    scaler = GradScaler("cuda")
 
     early_stopping = EarlyStopping(patience=config.patience)
     best_val_acc = 0.0
@@ -442,6 +414,7 @@ def train(config, train_dataset, val_dataset, device):
     start_time = time.time()
 
     print(f"\nStarting training for {config.epochs} epochs")
+    print("CB513 test accuracy is not used for model selection)\n")
 
     for epoch in range(config.epochs):
         epoch_start = time.time()
@@ -450,11 +423,13 @@ def train(config, train_dataset, val_dataset, device):
             train_loader,
             optimizer,
             scheduler,
-            scaler,
             device,
             config.label_smoothing,
         )
         val_loss, val_acc = evaluate(model, val_loader, device)
+
+        test_loss, test_acc = evaluate(model, test_loader, device)
+
         epoch_time = time.time() - epoch_start
 
         improved = val_acc > best_val_acc
@@ -465,14 +440,28 @@ def train(config, train_dataset, val_dataset, device):
             }
             best_path = os.path.join(config.checkpoint_dir, "best_model.pt")
             save_checkpoint(
-                model, optimizer, scheduler, scaler, epoch, val_acc, config, best_path
+                model,
+                optimizer,
+                scheduler,
+                epoch,
+                val_acc,
+                test_acc,
+                config,
+                best_path,
             )
 
         checkpoint_path = os.path.join(
             config.checkpoint_dir, f"checkpoint_epoch_{epoch + 1:03d}.pt"
         )
         save_checkpoint(
-            model, optimizer, scheduler, scaler, epoch, val_acc, config, checkpoint_path
+            model,
+            optimizer,
+            scheduler,
+            epoch,
+            val_acc,
+            test_acc,
+            config,
+            checkpoint_path,
         )
 
         status = " *" if improved else ""
@@ -480,6 +469,7 @@ def train(config, train_dataset, val_dataset, device):
             f"Epoch {epoch + 1:3d}/{config.epochs} | "
             f"Train Loss: {train_loss:.4f} Acc: {train_acc:.4f} | "
             f"Val Loss: {val_loss:.4f} Acc: {val_acc:.4f} | "
+            f"CB513 Loss: {test_loss:.4f} Acc: {test_acc:.4f} | "
             f"Time: {epoch_time:.1f}s{status}"
         )
 
@@ -532,16 +522,9 @@ def main():
         f"Train: {len(train_dataset)}, Val: {len(val_dataset)}, Test: {len(test_dataset)}"
     )
 
-    choice = input("Enter choice of training mode (1/2/3): ").strip() or "1"
+    config = ModelConfig
 
-    if choice == "1":
-        config = ModelConfig.quick()
-    elif choice == "2":
-        config = ModelConfig.medium()
-    else:
-        config = ModelConfig.full()
-
-    model = train(config, train_dataset, val_dataset, device)
+    model = train(config, train_dataset, val_dataset, test_dataset, device)
 
     test_sampler = SortedBatchSampler(
         test_dataset.lengths, config.batch_size, shuffle=False
@@ -555,10 +538,11 @@ def main():
     )
 
     test_loss, test_acc = evaluate(model, test_loader, device)
+    print("Final CB513 Test Results (Best Model)")
     print(f"CB513 Test Loss: {test_loss:.4f}")
     print(f"CB513 Test Accuracy (Q8): {test_acc:.4f} ({test_acc * 100:.2f}%)")
 
-    save_path = f"psp_esm_model_{choice}.pt"
+    save_path = "model.pt"
     torch.save(
         {
             "config": config,
